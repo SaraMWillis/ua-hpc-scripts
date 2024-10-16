@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os, sys, subprocess, argparse, math, time, getpass
+import os, sys, subprocess, argparse, math, time, getpass, pwd
 
 
 #------------------------------------------------------------------------------------#
@@ -8,17 +8,26 @@ import os, sys, subprocess, argparse, math, time, getpass
 #------------------------------------------------------------------------------------#
 
 def parse_arguments(args):
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="View HPC allocation",
+        formatter_class=lambda prog: argparse.HelpFormatter(prog,max_help_position=27)
+        )
     parser.add_argument('-d', '--debug', action='store_true', help='Increase output verbosity')
     parser.add_argument('-t', '--time',  action='store_true', help="Profile functions for time usage")
     parser.add_argument('-u', '--user', type=str, default=getpass.getuser(), help="Check a different user's allocation")
+    parser.add_argument('-g', '--group', type=str, help="View a breakdown of a group's allocation usage by user")
+    parser.add_argument('-c', '--classic', action='store_true',help="Classic display")
     
     args = parser.parse_args()
+    
+    
     return args
     
 #-----------------------------------pretty_time--------------------------------------#
 '''
-Format CPU minutes in a 
+Format CPU minutes so they're easy to read:
+input : minutes as a float or integer
+output: time formatted as hhhh:mm:ss
 '''
     
 def pretty_time(total_minutes):
@@ -80,16 +89,19 @@ def get_parent_ids(accounts):
             
         if group in accounts:
             if parent not in parent_dict.keys():
-                parent_dict[parent] = {"groups": {group: {"used": 0, "encumbered": 0}},
+                parent_dict[parent] = {"groups": {group: {"used": 0, "encumbered": 0, "main": False}},
                                        "owner": "",
                                        "total": {"allocated": 0, "encumbered": 0, "used": 0}
                                       }
             else:
-                parent_dict[parent]["groups"][group] = {"used": 0,"encumbered": 0} 
+                parent_dict[parent]["groups"][group] = {"used": 0,"encumbered": 0, "main":False} 
                 
     for parent, data in parent_dict.items():
         owner = owner_dict[parent]
         parent_dict[parent]["owner"] = owner
+        if owner in parent_dict[parent]["groups"].keys():
+            parent_dict[parent]["groups"][owner]["main"] = True
+
     return parent_dict
             
   
@@ -189,16 +201,37 @@ def calculate_allocations(parent_dict):
         standard_allocation = total_allocation
         standard_encumbered = total_encumbered
         standard_used       = total_used
-    
+        
+        main_group_exists = False
+        for g,d in data["groups"].items():
+            if d["main"] == True:
+                main_group_exists = True
+                main_group = g
+                break
+            else:
+                pass
+
         if "QOS" in data.keys():
             for q,d in data["QOS"].items():
                 standard_allocation = standard_allocation - float(d["allocated"])
                 standard_encumbered = standard_encumbered - float(d["encumbered"])
                 standard_used       = standard_used - math.floor(float(d["used"])/60)
-                d["remaining"] = float(d["allocated"]) - float(d["encumbered"]) - math.floor(float(d["used"]/60)) 
+                
+                if main_group_exists == True:
+                    data["groups"][main_group]["used"] = float(data["groups"][main_group]["used"]) - math.floor(float(d["used"])/60)
+                    data["groups"][main_group]["encumbered"] = float(data["groups"][main_group]["encumbered"]) -float(d["encumbered"]) 
+                
+                
+                d["remaining"] = pretty_time(float(d["allocated"]) - float(d["encumbered"]) - math.floor(float(d["used"]/60)))
+                d["used"] = pretty_time(math.floor(float(d["used"]/60)))
+                d["allocated"] = pretty_time(float(d["allocated"]))
+                d["encumbered"] = pretty_time(float(d["encumbered"]))
+        for g, d in data["groups"].items():
+            d["used"] = pretty_time(float(d["used"]))
+            d["encumbered"] = pretty_time(float(d["encumbered"]))
 
         standard_remaining = standard_allocation - standard_encumbered - standard_used
-        data["standard"] = {"allocated": standard_allocation, "encumbered": standard_encumbered, "used": standard_used, "remaining": standard_remaining}
+        data["standard"] = {"allocated": pretty_time(standard_allocation), "encumbered": pretty_time(standard_encumbered), "used": pretty_time(standard_used), "remaining": pretty_time(standard_remaining)}
 
     return parent_dict
         
@@ -231,27 +264,73 @@ PI: parent_1474 Total time: 150000:00:00
 def classic_display(parent_dict):
     print("Windfall: Unlimited\n")
     for parent, data in parent_dict.items():
-        print("PI: {} Total time: {}".format(parent,pretty_time(data["standard"]["allocated"])))
-        print("\tTotal used*: {}".format(pretty_time(data["standard"]["used"])))
-        print("\tTotal encumbered: {}".format(pretty_time(data["standard"]["encumbered"])))
-        print("\tTotal remaining: {}".format(pretty_time(data["standard"]["remaining"])))
+        print("PI: {} Total time: {}".format(parent,data["standard"]["allocated"]))
+        print("\tTotal used*: {}".format(data["standard"]["used"]))
+        print("\tTotal encumbered: {}".format(data["standard"]["encumbered"]))
+        print("\tTotal remaining: {}".format(data["standard"]["remaining"]))
         for g,d in data["groups"].items():
-            print("\tGroup: {} Time used: {} Time encumbered: {}".format(g,pretty_time(float(d["used"])),pretty_time(float(d["encumbered"]))))
+            print("\tGroup: {} Time used: {} Time encumbered: {}".format(g,d["used"],d["encumbered"]))
         print()
         #print(data)
         if "QOS" in data.keys():
             print("\tHigh Priority QOS(s):")
             for qos, alloc in data["QOS"].items():
                 print("\t{}:".format(qos))
-                print("\t\tTotal time: {}".format(pretty_time(float(alloc["allocated"]))))
-                print("\t\tTime used: {}".format( pretty_time( float(alloc["used"])/60 )))
-                print("\t\tTime encumbered: {}".format(pretty_time(float(alloc["encumbered"]))))
-                print("\t\tTime remaining: {}".format(pretty_time(float(alloc["remaining"]))))
+                print("\t\tTotal time: {}".format(alloc["allocated"]))
+                print("\t\tTime used: {}".format(alloc["used"]) )
+                print("\t\tTime encumbered: {}".format(alloc["encumbered"]))
+                print("\t\tTime remaining: {}".format(alloc["remaining"]))
         print()
         #print(parent,data)
     
+def new_display(parent_dict):
+    width = 94
     
-
+    edge_separator = " "+"_"*(width-2)+" "
+    mid_separator  = "+"+"-"*(width-2)+"+"
+    
+    formatting_string    = "|{0:13} | {1:15} | {2:>12} | {3:>12} | {4:>12} | {5:>12} |"
+    header_string     = "|{}|"
+    
+    for parent, data in parent_dict.items():
+        #print(parent,data)
+        print()
+        print(edge_separator)
+        print(header_string.format(str("PI Sponsor: "+data["owner"]).center(width-2)))
+        print(header_string.format(str("Accounts: "+", ".join(data["groups"].keys())).center(width-2)))
+        print(mid_separator)
+        print(formatting_string.format("Allocation","Group","Total","Used","Encumbered","Remaining"))
+        print(mid_separator)
+        print(formatting_string.format("Standard","",data["standard"]["allocated"],data["standard"]["used"],data["standard"]["encumbered"],data["standard"]["remaining"]))
+        for g,d in data["groups"].items():
+            print(formatting_string.format("",g,"",d["used"],d["encumbered"],""))
+        
+        if "QOS" in data.keys():
+            print(mid_separator)
+            #print(data["QOS"])
+            for q,d in data["QOS"].items():
+                if "user_qos" in q:
+                    grp = q.split("user_qos_")[-1]
+                    print(formatting_string.format("High Priority",grp,d["allocated"],d["used"],d["encumbered"],d["remaining"]))
+                elif "qual_qos" in q:
+                    grp = q.split("qual_qos_")[-1]
+                    print(formatting_string.format("Qualified",grp,d["allocated"],d["used"],d["encumbered"],d["remaining"]))
+        print(edge_separator)
+    print()
+    sys.exit(0)
+    print()
+    #print("A new display?! How exciting!")
+    print(edge_separator)
+    print("|"+"PI Sponsor: foo".center(width-2)+"|")
+    print("|"+"Accounts: bar,baz".center(width-2)+"|")
+    print(mid_separator)
+    print(formatting_string.format("Allocation","Group","Total","Used","Encumbered","Remaining"))
+    print(mid_separator)
+    print(formatting_string.format("Standard","Total","15000:00:00","00:00:00","00:00:00","00:00:00"))
+    print(edge_separator)
+    
+    print()
+    
 #------------------------------------------------------------------------------------#
 #                               Program Executes Below                               #
 #------------------------------------------------------------------------------------#
@@ -259,15 +338,34 @@ def classic_display(parent_dict):
 if __name__ == "__main__":
     args = parse_arguments(sys.argv[1:])
     
-    groups = get_hpc_groups(args.user)
+    try:
+        pwd.getpwnam(args.user)
+    except KeyError:
+        print("{} is not a valid username.".format(args.user))
+        sys.exit(1)
     
+    groups = get_hpc_groups(args.user)
     parent_dict = get_parent_ids(groups)
     
+    if bool(parent_dict) == False:
+        if len(groups) != 0:
+            print("\nError: No research allocations found.")
+            print("If you are a member of a class group, please use the Ocelote cluster.")
+            print("Group membership: {}\n".format(",".join(groups)))
+            sys.exit(1)
+        else:
+            print("Error: You are not a member of an HPC group.")
+            sys.exit(1)
+            
     qos_dict = get_qos_alloc()
     parent_dict = get_qos(parent_dict, qos_dict)
     parent_dict = get_standard_alloc(parent_dict)
     parent_dict = calculate_allocations(parent_dict)
-    classic_display(parent_dict)
+    
+    if args.classic == True:
+        classic_display(parent_dict)
+    else:
+        new_display(parent_dict)
 
 
     
