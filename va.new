@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+
+import os, sys, subprocess, argparse, math, time, getpass
+
+
+#------------------------------------------------------------------------------------#
+#                                     Subroutines                                    #
+#------------------------------------------------------------------------------------#
+
+def parse_arguments(args):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-d', '--debug', action='store_true', help='Increase output verbosity')
+    parser.add_argument('-t', '--time',  action='store_true', help="Profile functions for time usage")
+    parser.add_argument('-u', '--user', type=str, default=getpass.getuser(), help="Check a different user's allocation")
+    
+    args = parser.parse_args()
+    return args
+    
+#-----------------------------------pretty_time--------------------------------------#
+'''
+Format CPU minutes in a 
+'''
+    
+def pretty_time(total_minutes):
+    whole_minutes = math.floor(total_minutes)
+    fractional_minutes = total_minutes - whole_minutes 
+    
+    hours = whole_minutes // 60
+    minutes = whole_minutes % 60
+    seconds = int(fractional_minutes * 60)
+    
+    return f"{hours}:{minutes:02}:{seconds:02}"
+    
+
+#---------------------------------get_hpc_groups-------------------------------------#
+'''
+Get a user's HPC groups. HPC groups have a value greater than 30000
+
+(ocelote) [sarawillis@junonia va]$ /usr/bin/id -G
+340 1011 1014 1017 1018 1020 1035 1037 1038 1041 1042 28890 28900 28902 30001 30610 30772 31238 31674 45066 45162
+'''
+def get_hpc_groups(user):
+
+    grps_out = subprocess.run(['/usr/bin/id', '-G', user], stdout = subprocess.PIPE)
+    grps = grps_out.stdout.decode('utf-8').rstrip()
+    group_ids = [i for i in grps.split(" ") if int(i) >= 30000]
+
+    # If no HPC group IDs were found, user is probably not sponsored. Return empty list
+    if len(group_ids) ==0:
+        return groups
+        
+    # If at least one HPC group was found, find the human-readable group name(s)
+    groups = []
+    for gid in group_ids:
+        group = subprocess.run(['getent', 'group', gid], stdout = subprocess.PIPE)
+        group = group.stdout.decode('utf-8').rstrip().split(":")[0]
+        groups.append(group)
+
+    return groups
+    
+    
+    
+#---------------------------------get_parent_ids-------------------------------------#
+def get_parent_ids(accounts):
+    # sacctmgr --parsable2 show account format=Account,Org --noheader | grep parent
+    
+    parent_dict = {}
+    owner_dict = {}
+    
+    out = subprocess.run('sacctmgr --parsable2 show account format=Account,Org,Description --noheader | grep parent', shell=True, stdout = subprocess.PIPE)
+    group_data = out.stdout.decode("utf-8").rstrip().split("\n")
+    
+    for datum in group_data:
+        group,parent,desc = datum.split("|")
+        if "parent_" in group:
+            desc = desc.split(" ")
+            if desc[0] == "top":
+                owner = desc[-1]
+                owner_dict[group] = owner
+            
+        if group in accounts:
+            if parent not in parent_dict.keys():
+                parent_dict[parent] = {"groups": {group: {"used": 0, "encumbered": 0}},
+                                       "owner": "",
+                                       "total": {"allocated": 0, "encumbered": 0, "used": 0}
+                                      }
+            else:
+                parent_dict[parent]["groups"][group] = {"used": 0,"encumbered": 0} 
+                
+    for parent, data in parent_dict.items():
+        owner = owner_dict[parent]
+        parent_dict[parent]["owner"] = owner
+    return parent_dict
+            
+  
+#---------------------------------get_qos_alloc--------------------------------------#   
+def get_qos_alloc():
+    
+    qos_dict = {}
+    qos_out = subprocess.run('sacctmgr --parsable2 show qos --noheader', shell=True, stdout = subprocess.PIPE)
+    for i in qos_out.stdout.decode("utf-8").rstrip().split("\n"):
+        qos_data = i.split("|")
+        qos, alloc = qos_data[0],qos_data[10]
+        if alloc != "":
+            qos_dict[qos] = {"alloc": alloc.split("=")[-1]}
+            
+    qos_out = subprocess.run('scontrol -o show assoc flags=qos', shell=True, stdout = subprocess.PIPE)
+    for i in qos_out.stdout.decode("utf-8").rstrip().split("\n"):
+        for j in i.split(" "):
+            if "QOS" in j:
+                qos = j.split("=")[-1].split("(")[0]
+            if qos in qos_dict.keys():
+                if "UsageRaw" in j:
+                    qos_dict[qos]["usage"] = float(j.split("=")[-1])
+                elif "GrpTRESRunMins" in j:
+                    qos_encumbered = int(j.split(",")[0].split("(")[-1].replace(")",""))
+                    qos_dict[qos]["encumbered"] = qos_encumbered
+    #print(qos_dict)
+    return qos_dict
+  
+  
+#------------------------------------get_qos-----------------------------------------#
+def get_qos(parent_dict,qos_dict):
+    parent_ids = ",".join(parent_dict.keys())
+    qos_out = subprocess.run('sacctmgr --parsable2 --noheader show association where account=%s format=account,qos | sort -u'%parent_ids, shell=True, stdout = subprocess.PIPE)
+    for qos_vals in qos_out.stdout.decode("utf-8").rstrip().split("\n"):
+        parent,qos = qos_vals.split("|")
+        split_qos = qos.split(",")
+        if len(split_qos) > 1:
+            parent_dict[parent]["QOS"] = {}
+            for q in split_qos:
+                if q == "part_qos_standard":
+                    pass
+                else:
+                    parent_dict[parent]["QOS"][q] = { "allocated": qos_dict[q]["alloc"],"encumbered": qos_dict[q]["encumbered"], "used": qos_dict[q]["usage"]}
+                    
+    return parent_dict
+    
+
+#------------------------------get_standard_alloc------------------------------------#
+def get_standard_alloc(parent_dict):
+    
+    standard_out = subprocess.run('/usr/bin/sshare --parsable2 --noheader --format Account,User,GrpTRESMins,GrpTRESRaw,TRESRunMins', shell=True, stdout = subprocess.PIPE)
+    standard_out = standard_out.stdout.decode("utf-8").rstrip().split("\n")
+    parents = {}
+    groups = {}
+    for data in standard_out:
+        stripped_data = data.lstrip()
+        #print(stripped_data)
+        split_account = stripped_data.split("|")
+        if split_account == [""]:
+            pass
+        elif split_account[1] == "":
+            #group_used = split_account[3].split(",")[0].split("cpu=")[-1]
+            #group_encumbered = split_account[4].split(",")[0].split("cpu=")[-1]
+            
+            if "parent_" in split_account[0]:
+
+                total_allocation = split_account[2].split("cpu=")[-1]
+                total_used = split_account[3].split(",")[0].split("cpu=")[-1]
+                total_encumbered = split_account[4].split(",")[0].split("cpu=")[-1]
+                parents[split_account[0]] = {"allocated": total_allocation,"used": total_used,"encumbered":total_encumbered}
+            else:
+                group_used = split_account[3].split(",")[0].split("cpu=")[-1]
+                group_encumbered = split_account[4].split(",")[0].split("cpu=")[-1]
+                groups[split_account[0]] = {"used": group_used,"encumbered":group_encumbered}
+            
+        
+    for parent, data in parent_dict.items():
+        data["total"]["allocated"] = parents[parent]["allocated"]
+        data["total"]["encumbered"] = parents[parent]["encumbered"]
+        data["total"]["used"] = parents[parent]["used"]
+        
+        for g,d in data["groups"].items():
+            d["used"] = groups[g]["used"]
+            d["encumbered"] = groups[g]["encumbered"]
+
+    return parent_dict
+    
+
+#----------------------------calculate_allocations-----------------------------------#
+def calculate_allocations(parent_dict):
+    #print(parent_dict)
+    for parent, data in parent_dict.items():
+        total_allocation = float(data["total"]["allocated"])
+        total_encumbered = float(data["total"]["encumbered"])
+        total_used       = float(data["total"]["used"])
+        
+        standard_allocation = total_allocation
+        standard_encumbered = total_encumbered
+        standard_used       = total_used
+    
+        if "QOS" in data.keys():
+            for q,d in data["QOS"].items():
+                standard_allocation = standard_allocation - float(d["allocated"])
+                standard_encumbered = standard_encumbered - float(d["encumbered"])
+                standard_used       = standard_used - math.floor(float(d["used"])/60)
+                d["remaining"] = float(d["allocated"]) - float(d["encumbered"]) - math.floor(float(d["used"]/60)) 
+
+        standard_remaining = standard_allocation - standard_encumbered - standard_used
+        data["standard"] = {"allocated": standard_allocation, "encumbered": standard_encumbered, "used": standard_used, "remaining": standard_remaining}
+
+    return parent_dict
+        
+        
+        
+'''
+Windfall: Unlimited
+
+PI: parent_614 Total time: 150000:00:00
+	Total used*: 5337:51:00
+	Total encumbered: 0:00:00
+	Total remaining: 144662:09:00
+	Group: krishna Time used: 5149:14:00 Time encumbered: 0:00:00
+
+PI: parent_1474 Total time: 150000:00:00
+	Total used*: 0:00:00
+	Total encumbered: 0:00:00
+	Total remaining: 150000:00:00
+	Group: zwickl Time used: 0:00:00 Time encumbered: 0:00:00
+
+	High Priority QOS(s):
+	qual_qos_zwickl:
+		Total time: 100000:00:00
+		Time used: 0:00:00
+		Time encumbered: 0:00:00
+		Time remaining: 100000:00:00
+
+'''
+        
+def classic_display(parent_dict):
+    print("Windfall: Unlimited\n")
+    for parent, data in parent_dict.items():
+        print("PI: {} Total time: {}".format(parent,pretty_time(data["standard"]["allocated"])))
+        print("\tTotal used*: {}".format(pretty_time(data["standard"]["used"])))
+        print("\tTotal encumbered: {}".format(pretty_time(data["standard"]["encumbered"])))
+        print("\tTotal remaining: {}".format(pretty_time(data["standard"]["remaining"])))
+        for g,d in data["groups"].items():
+            print("\tGroup: {} Time used: {} Time encumbered: {}".format(g,pretty_time(float(d["used"])),pretty_time(float(d["encumbered"]))))
+        print()
+        #print(data)
+        if "QOS" in data.keys():
+            print("\tHigh Priority QOS(s):")
+            for qos, alloc in data["QOS"].items():
+                print("\t{}:".format(qos))
+                print("\t\tTotal time: {}".format(pretty_time(float(alloc["allocated"]))))
+                print("\t\tTime used: {}".format( pretty_time( float(alloc["used"])/60 )))
+                print("\t\tTime encumbered: {}".format(pretty_time(float(alloc["encumbered"]))))
+                print("\t\tTime remaining: {}".format(pretty_time(float(alloc["remaining"]))))
+        print()
+        #print(parent,data)
+    
+    
+
+#------------------------------------------------------------------------------------#
+#                               Program Executes Below                               #
+#------------------------------------------------------------------------------------#
+
+if __name__ == "__main__":
+    args = parse_arguments(sys.argv[1:])
+    
+    groups = get_hpc_groups(args.user)
+    
+    parent_dict = get_parent_ids(groups)
+    
+    qos_dict = get_qos_alloc()
+    parent_dict = get_qos(parent_dict, qos_dict)
+    parent_dict = get_standard_alloc(parent_dict)
+    parent_dict = calculate_allocations(parent_dict)
+    classic_display(parent_dict)
+
+
+    
